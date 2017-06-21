@@ -21,7 +21,7 @@ typedef std::thread t_thread;
 namespace util {
 	template<typename type> type clamp(type v, type a, type b) { return (std::max(a, std::min(b, v))); }
 
-	// roll our own for C++11
+	// missing in C++11, roll our own
 	template<typename t_type, typename... t_args>
 	std::unique_ptr<t_type> make_unique(t_args&&... args) {
 		return (std::unique_ptr<t_type>(new t_type(std::forward<t_args>(args)...)));
@@ -39,6 +39,7 @@ namespace util {
 };
 
 namespace threading {
+	// stubs
 	struct t_signal {
 		void wait_for(const t_time&) {}
 		void notify_all(uint32_t) {}
@@ -107,7 +108,7 @@ namespace thread_pool {
 
 				#ifdef USE_TASK_STATS_TRACKING
 				const uint64_t wdt = tg->get_dt(t_time::now());
-				const uint64_t edt = tg->execute_loop(false);
+				const uint64_t edt = tg->execute_loop(thread_id, false);
 
 				thread_stats[queue_idx][thread_id].num_tasks_run += 1;
 				thread_stats[queue_idx][thread_id].sum_exec_time += edt;
@@ -117,7 +118,7 @@ namespace thread_pool {
 				thread_stats[queue_idx][thread_id].min_wait_time  = std::min(thread_stats[queue_idx][thread_id].min_wait_time, wdt);
 				thread_stats[queue_idx][thread_id].max_wait_time  = std::max(thread_stats[queue_idx][thread_id].max_wait_time, wdt);
 				#else
-				tg->execute_loop(false);
+				tg->execute_loop(thread_id, false);
 				#endif
 			}
 
@@ -130,7 +131,7 @@ namespace thread_pool {
 
 				#ifdef USE_TASK_STATS_TRACKING
 				const uint64_t wdt = tg->get_dt(t_time::now());
-				const uint64_t edt = tg->execute_loop(false);
+				const uint64_t edt = tg->execute_loop(thread_id, false);
 
 				thread_stats[queue_idx][thread_id].num_tasks_run += 1;
 				thread_stats[queue_idx][thread_id].sum_exec_time += edt;
@@ -140,7 +141,7 @@ namespace thread_pool {
 				thread_stats[queue_idx][thread_id].min_wait_time  = std::min(thread_stats[queue_idx][thread_id].min_wait_time, wdt);
 				thread_stats[queue_idx][thread_id].max_wait_time  = std::max(thread_stats[queue_idx][thread_id].max_wait_time, wdt);
 				#else
-				tg->execute_loop(false);
+				tg->execute_loop(thread_id, false);
 				#endif
 			}
 		}
@@ -190,7 +191,7 @@ namespace thread_pool {
 		{
 			assert(!task_group->is_async_task());
 			assert(!task_group->self_delete());
-			task_group->execute_loop(true);
+			task_group->execute_loop(thread_id, true);
 		}
 
 		// NOTE:
@@ -198,12 +199,13 @@ namespace thread_pool {
 		//   entirely by the loop above, before any worker thread has
 		//   even had a chance to pop it from the queue (so returning
 		//   under that condition could cause the group to be deleted
-		//   prematurely if non-pooled) --> wait
+		//   or reassigned prematurely) --> wait
 		if (task_group->is_finished()) {
-			while (!task_group->is_in_pool() && task_group->is_in_queue()) {
+			while (!task_group->is_in_queue()) {
 				exec_tasks(thread_id, BASIC_TASK_QUEUE_IDX);
 			}
 
+			task_group->reset_state(false, task_group->is_in_pool(), false);
 			return;
 		}
 
@@ -224,9 +226,11 @@ namespace thread_pool {
 			}
 		} while (!task_group->is_finished() && !exit_flags[thread_id]);
 
-		while (!task_group->is_in_pool() && task_group->is_in_queue()) {
+		while (task_group->is_in_queue()) {
 			exec_tasks(thread_id, BASIC_TASK_QUEUE_IDX);
 		}
+
+		task_group->reset_state(false, task_group->is_in_pool(), false);
 	}
 
 

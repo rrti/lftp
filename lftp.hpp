@@ -73,87 +73,7 @@ struct t_time {
 	bool operator > (const t_time&) const { return false; }
 };
 
-
-
-class t_base_task_group {
-public:
-	t_base_task_group(const bool getid = true, const bool pooled = false): m_id(getid? last_id.fetch_add(1): -1u), m_ts(0) {
-		reset_state(pooled);
-	}
-
-	virtual ~t_base_task_group() {
-		// pooled tasks are deleted only when their pool dies (on exit)
-		assert(is_finished() && (!is_in_queue() || is_in_pool()));
-	}
-
-	virtual bool is_async_task() const { return false; }
-	virtual bool execute_step() = 0;
-	virtual bool self_delete() const { return false; }
-
-	uint64_t execute_loop(bool wff_call) {
-		const t_time t0 = t_time::now();
-
-		while (execute_step());
-
-		const t_time t1 = t_time::now();
-		const t_time dt = t1 - t0;
-
-		if (!wff_call) {
-			// do not set this from WFF, defeats the purpose
-			assert(m_in_task_queue.load());
-			m_in_task_queue.store(false);
-		}
-
-		if (self_delete())
-			delete this;
-
-		return (dt.to_ns());
-	}
-
-	bool is_finished() const { assert(m_remaining_tasks.load() >= 0); return (m_remaining_tasks.load(std::memory_order_relaxed) == 0); }
-	bool is_in_queue() const { return (m_in_task_queue.load(std::memory_order_relaxed)); }
-	bool is_in_pool() const { return (m_in_task_pool.load(std::memory_order_relaxed)); }
-
-	int32_t remaining_tasks() const { return m_remaining_tasks; }
-	int32_t wanted_thread() const { return m_wanted_thread; }
-
-	bool wait_for(const t_time& rel_time) const {
-		const t_time end_time = t_time::now() + rel_time;
-		while (!is_finished() && (t_time::now() < end_time));
-		return (is_finished());
-	}
-
-	uint32_t get_id() const { return m_id; }
-	uint64_t get_dt(const t_time t) const { return (t.to_ns() - m_ts); }
-
-	void update_id() { m_id = last_id.fetch_add(1); }
-	void set_ts(const t_time t) { m_ts = t.to_ns(); }
-
-	void reset_state(bool pooled) {
-		m_remaining_tasks = 0;
-		m_wanted_thread = 0;
-
-		m_in_task_queue = true;
-		m_in_task_pool = pooled;
-	}
-
-public:
-	std::atomic<int32_t> m_remaining_tasks;
-	// if 0 (default), task will be executed by an arbitrary thread
-	std::atomic<int32_t> m_wanted_thread;
-
-	std::atomic_bool m_in_task_queue;
-	std::atomic_bool m_in_task_pool;
-
-private:
-	static std::atomic<uint32_t> last_id;
-
-	uint32_t m_id;
-	uint64_t m_ts; // timestamp (ns)
-};
-
-
-
+class t_base_task_group;
 namespace thread_pool {
 	template<class F, class... Args>
 	static auto enqueue(F&& f, Args&&... args)
@@ -180,6 +100,102 @@ namespace thread_pool {
 	uint32_t get_max_threads();
 
 	static constexpr uint32_t MAX_THREADS = 16;
+};
+
+
+
+class t_base_task_group {
+public:
+	t_base_task_group(const bool getid = true, const bool pooled = false): m_id(getid? last_id.fetch_add(1): -1u), m_ts(0) {
+		reset_state(!pooled, pooled, false);
+	}
+
+	virtual ~t_base_task_group() {
+		assert(allow_delete());
+	}
+
+	virtual bool is_async_task() const { return false; }
+	virtual bool is_slice_task() const { return false; }
+	virtual bool execute_step() = 0;
+	virtual bool self_delete() const { return false; }
+
+	uint64_t execute_loop(int thread_id, bool wff_call) {
+		const t_time t0 = t_time::now();
+
+		if (!wff_call && is_slice_task() && execute_step()) {
+			thread_pool::push_task_group(this);
+			return ((t_time::now() - t0).to_ns());
+		}
+
+		while (execute_step());
+
+		const t_time t1 = t_time::now();
+		const t_time dt = t1 - t0;
+
+		if (!wff_call) {
+			// do not set this from WFF, would defeat the purpose
+			assert(m_in_task_queue.load());
+			m_in_task_queue.store(false);
+		}
+
+		if (self_delete()) {
+			// store *after* the check in both branches, avoids UAF
+			// async-tasks can never have a parent waiting for them
+			m_exec_loop_done.store(true);
+			delete this;
+		} else {
+			m_exec_loop_done.store(exec_loop_done() || !wff_call);
+		}
+
+		return (dt.to_ns());
+	}
+
+	bool is_finished() const { assert(m_remaining_tasks.load() >= 0); return (m_remaining_tasks.load(std::memory_order_relaxed) == 0); }
+	bool is_in_queue() const { return (m_in_task_queue.load(std::memory_order_relaxed)); }
+	bool is_in_pool() const { return ((m_pool_bitmask.load(std::memory_order_relaxed) & (1 << 0)) != 0); }
+	bool is_in_puse() const { return ((m_pool_bitmask.load(std::memory_order_relaxed) & (1 << 1)) != 0); }
+
+	bool exec_loop_done() const { return (m_exec_loop_done.load(std::memory_order_relaxed)); }
+	// pooled tasks are deleted only when their pool dies (on exit), which is always allowed
+	bool allow_delete() const { return (is_finished() && ((!is_in_queue() && exec_loop_done()) || is_in_pool())); }
+
+	int32_t remaining_tasks() const { return m_remaining_tasks; }
+	int32_t wanted_thread() const { return m_wanted_thread; }
+
+	bool wait_for(const t_time& rel_time) const {
+		const t_time end_time = t_time::now() + rel_time;
+		while (!is_finished() && (t_time::now() < end_time));
+		return (is_finished());
+	}
+
+	uint32_t get_id() const { return m_id; }
+	uint64_t get_dt(const t_time t) const { return (t.to_ns() - m_ts); }
+
+	void update_id() { m_id = last_id.fetch_add(1); }
+	void set_ts(const t_time t) { m_ts = t.to_ns(); }
+
+	void reset_state(bool queued, bool pooled, bool inuse) {
+		m_remaining_tasks.store(0);
+		m_wanted_thread.store(0);
+		m_pool_bitmask.store(((1 * pooled) << 0) + ((1 * inuse) << 1));
+
+		m_in_task_queue.store(queued);
+		m_exec_loop_done.store(false);
+	}
+
+public:
+	std::atomic<int32_t> m_remaining_tasks;
+	std::atomic<int32_t> m_wanted_thread; // if 0 (default), task will be executed by an arbitrary thread
+	std::atomic<int32_t> m_pool_bitmask; // whether this task is managed (owned) and in use by a task_pool
+
+	std::atomic_bool m_in_task_queue; // whether this task is still in a thread's queue
+	std::atomic_bool m_exec_loop_done; // whether the thread running this task is about to exit exec_loop
+
+private:
+	static std::atomic<uint32_t> last_id;
+
+	uint32_t m_id;
+	uint64_t m_ts; // timestamp (ns)
 };
 
 
@@ -221,7 +237,7 @@ public:
 template<class F, typename R = int, class... Args>
 class t_ext_task_group: public t_base_task_group {
 public:
-	t_ext_task_group(const int32_t num = 0): m_cur_task(0) {
+	t_ext_task_group(const int32_t num = 0): m_task(0) {
 		m_results.reserve(num);
 		m_tasks.reserve(num);
 	}
@@ -238,7 +254,7 @@ public:
 
 
 	bool execute_step() override {
-		const int32_t pos = m_cur_task.fetch_add(1, std::memory_order_relaxed);
+		const int32_t pos = m_task.fetch_add(1, std::memory_order_relaxed);
 
 		if (pos < m_tasks.size()) {
 			m_tasks[pos]();
@@ -255,7 +271,7 @@ public:
 	}
 
 public:
-	std::atomic<int32_t> m_cur_task;
+	std::atomic<int32_t> m_task;
 	std::vector<std::function<void()>> m_tasks;
 	std::vector<std::future<return_type>> m_results;
 };
@@ -266,7 +282,7 @@ public:
 template<class F, typename ...Args>
 class t_ext_task_group<F, void, Args...>: public t_base_task_group {
 public:
-	t_ext_task_group(const int32_t num = 0): m_cur_task(0) {
+	t_ext_task_group(const int32_t num = 0): m_task(0) {
 		m_tasks.reserve(num);
 	}
 
@@ -276,7 +292,7 @@ public:
 	}
 
 	bool execute_step() override {
-		const int32_t pos = m_cur_task.fetch_add(1, std::memory_order_relaxed);
+		const int32_t pos = m_task.fetch_add(1, std::memory_order_relaxed);
 
 		if (pos < m_tasks.size()) {
 			m_tasks[pos]();
@@ -288,7 +304,7 @@ public:
 	}
 
 public:
-	std::atomic<int32_t> m_cur_task;
+	std::atomic<int32_t> m_task;
 	std::vector<std::function<void()>> m_tasks;
 };
 
@@ -296,7 +312,7 @@ public:
 template<class F>
 class t_ext_task_group<F, void>: public t_base_task_group {
 public:
-	t_ext_task_group(const int32_t num = 0): m_cur_task(0) {
+	t_ext_task_group(const int32_t num = 0): m_task(0) {
 		m_tasks.reserve(num);
 	}
 
@@ -306,7 +322,7 @@ public:
 	}
 
 	bool execute_step() override {
-		const int32_t pos = m_cur_task.fetch_add(1, std::memory_order_relaxed);
+		const int32_t pos = m_task.fetch_add(1, std::memory_order_relaxed);
 
 		if (pos < m_tasks.size()) {
 			m_tasks[pos]();
@@ -318,13 +334,22 @@ public:
 	}
 
 public:
-	std::atomic<int32_t> m_cur_task;
+	std::atomic<int32_t> m_task;
 	std::vector<std::function<void()>> m_tasks;
 };
 
+#if 0
+template<typename F, typename ...Args>
+class t_arg_task_group: public t_ext_task_group<F, decltype(std::declval<F>()((std::declval<Args>())...)), Args...> {
+public:
+	typedef decltype(std::declval<F>()((std::declval<Args>())...)) R;
+
+	t_arg_task_group(const int32_t num = 0): t_ext_task_group<F, R, Args...>(num) {}
+};
+#endif
 
 
-
+#if 0
 template<typename F, typename return_type = int, typename... Args>
 class t_parallel_task_group: public t_ext_task_group<F, return_type, Args...> {
 public:
@@ -366,8 +391,23 @@ public:
 public:
 	std::array<std::function<void()>, thread_pool::MAX_THREADS> m_unique_tasks;
 };
+#endif
 
 
+#if 0
+template<typename F, typename ...Args>
+class t_ext_parallel_task_group: public t_parallel_task_group<F, decltype(std::declval<F>()((std::declval<Args>())...)), Args...> {
+public:
+	typedef decltype(std::declval<F>()((std::declval<Args>())...)) R;
+
+	t_ext_parallel_task_group(const int32_t num = 0): t_parallel_task_group<F, R, Args...>(num) {}
+};
+#endif
+
+
+
+
+#if 0
 template<typename F>
 class t_parallel_alt_task_group: public t_base_task_group {
 public:
@@ -399,37 +439,69 @@ public:
 	std::function<void()> m_func;
 };
 
+#else
 
-
-
-template<typename F, typename ...Args>
-class t_arg_task_group: public t_ext_task_group<F, decltype(std::declval<F>()((std::declval<Args>())...)), Args...> {
+template<typename F>
+class t_parallel_alt_task_group: public t_base_task_group {
 public:
-	typedef decltype(std::declval<F>()((std::declval<Args>())...)) R;
+	typedef  t_ext_task_group<F, void>  t_child_task_type;
 
-	t_arg_task_group(const int32_t num = 0): t_ext_task_group<F, R, Args...>(num) {}
+	t_parallel_alt_task_group(bool pooled) : t_base_task_group(false, pooled) {}
+
+	void enqueue(F& func)
+	{
+		// note: GNT counts main so we would be short one worker
+		// (final task would never be executed and hang the pool)
+		m_remaining_tasks.store(thread_pool::get_num_threads() - 1);
+
+		m_child_tasks.clear();
+		m_child_tasks.reserve(m_remaining_tasks);
+
+		for (int i = 0; i < m_remaining_tasks; i++) {
+			auto task = std::make_shared<t_child_task_type>(1);
+
+			task->enqueue(func);
+			task->m_wanted_thread.store(1 + i % (thread_pool::get_num_threads() - 1));
+
+			m_child_tasks.push_back(task);
+			thread_pool::push_task_group(task);
+		}
+	}
+
+	bool execute_step() override
+	{
+		bool is_finished = true;
+
+		for (size_t n = 0; n < m_child_tasks.size(); n++) {
+			is_finished &= m_child_tasks[n]->allow_delete();
+		}
+
+		if (!is_finished)
+			return true;
+
+		m_remaining_tasks.store(0);
+		m_child_tasks.clear();
+		return false;
+	}
+
+private:
+	std::vector< std::shared_ptr<t_base_task_group> > m_child_tasks;
 };
 
-template<typename F, typename ...Args>
-class t_ext_parallel_task_group: public t_parallel_task_group<F, decltype(std::declval<F>()((std::declval<Args>())...)), Args...> {
-public:
-	typedef decltype(std::declval<F>()((std::declval<Args>())...)) R;
-
-	t_ext_parallel_task_group(const int32_t num = 0): t_parallel_task_group<F, R, Args...>(num) {}
-};
+#endif
 
 
 
 template<typename F>
 class t_for_task_group: public t_base_task_group {
 public:
-	t_for_task_group(bool pooled): t_base_task_group(false, pooled), m_cur_task(0) {}
+	t_for_task_group(bool pooled): t_base_task_group(false, pooled), m_task(0) {}
 
 	void enqueue(const int32_t from, const int32_t to, const int32_t step, F& func) {
 		assert(to >= from);
 		m_remaining_tasks = (step == 1) ? (to - from): ((to - from + step - 1) / step);
 
-		m_cur_task = {0};
+		m_task = {0};
 		m_func = func;
 
 		m_from = from;
@@ -438,7 +510,7 @@ public:
 	}
 
 	bool execute_step() override {
-		const int32_t i = m_from + (m_step * m_cur_task.fetch_add(1, std::memory_order_relaxed));
+		const int32_t i = m_from + (m_step * m_task.fetch_add(1, std::memory_order_relaxed));
 
 		if (i < m_to) {
 			m_func(i);
@@ -450,7 +522,7 @@ public:
 	}
 
 public:
-	std::atomic<int32_t> m_cur_task;
+	std::atomic<int32_t> m_task;
 	std::function<void(const int)> m_func;
 
 	int32_t m_from;
@@ -475,7 +547,7 @@ struct t_task_pool {
 	std::atomic<int32_t> m_pool_idx = {0};
 
 	t_task_pool() {
-		for (int32_t i = 0; i < m_tg_pool.size(); ++i) {
+		for (size_t i = 0; i < m_tg_pool.size(); ++i) {
 			m_tg_pool[i] = func_task_group_ptr(new func_task_group(true));
 		}
 	}
@@ -485,8 +557,12 @@ struct t_task_pool {
 
 		assert(tg->is_finished());
 		assert(tg->is_in_pool());
+		assert(!tg->is_in_queue());
+		// group might be out of the queue, but it could have already
+		// been handed out (in case of wraparound) under extreme load
+		assert(!tg->is_in_puse());
 
-		tg->reset_state(true);
+		tg->reset_state(true, true, true);
 		return tg;
 	}
 };
@@ -509,8 +585,9 @@ static inline void for_mt(int32_t start, int32_t end, int32_t step, F&& f) {
 
 	task_group->enqueue(start, end, step, f);
 	task_group->update_id();
-	thread_pool::push_task_group(task_group);
-	thread_pool::wait_for_finished(task_group); // make calling thread also run execute_loop
+
+	thread_pool::push_task_group(task_group); // note: for_task re-queues itself for each slice
+	thread_pool::wait_for_finished(task_group); // make the calling thread also run execute_loop
 }
 
 template <typename F>
@@ -531,7 +608,9 @@ static inline void parallel(F&& f) {
 
 	task_group->enqueue(f);
 	task_group->update_id();
-	thread_pool::push_task_group(task_group);
+
+	// note: child-tasks are pushed, parent itself should not be
+	// thread_pool::push_task_group(task_group);
 	thread_pool::wait_for_finished(task_group);
 }
 
@@ -560,8 +639,8 @@ static inline auto parallel_reduce(F&& f, G&& g) -> typename std::result_of<F()>
 	tasks[0] = new t_async_task<F>(std::forward<F>(f));
 	results[0] = std::move(tasks[0]->get_future());
 
-	// first job usually wants to run on the main thread
-	tasks[0]->execute_loop(false);
+	// first job in a reduction usually wants to run on the main thread
+	tasks[0]->execute_loop(0, false);
 
 	// need to push N individual tasks; see NOTE in t_parallel_task_group
 	for (size_t i = 1; i < results.size(); ++i) {
