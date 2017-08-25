@@ -122,20 +122,25 @@ public:
 	uint64_t execute_loop(int thread_id, bool wff_call) {
 		const t_time t0 = t_time::now();
 
-		if (!wff_call && is_slice_task() && execute_step()) {
-			thread_pool::push_task_group(this);
-			return ((t_time::now() - t0).to_ns());
-		}
-
 		while (execute_step());
 
 		const t_time t1 = t_time::now();
 		const t_time dt = t1 - t0;
 
-		if (!wff_call) {
-			// do not set this from WFF, would defeat the purpose
-			assert(m_in_task_queue.load());
+		if (is_slice_task()) {
+			// in_task_queue would be set to false prematurely by the
+			// first slice to finish, let it be handled by WFF (which
+			// blocks until all threads are)
+			if (!wff_call)
+				return (dt.to_ns());
+
 			m_in_task_queue.store(false);
+		} else {
+			// do not set this to false from WFF, defeats the purpose
+			if (!wff_call) {
+				assert(m_in_task_queue.load());
+				m_in_task_queue.store(wff_call);
+			}
 		}
 
 		if (self_delete()) {
@@ -448,8 +453,7 @@ public:
 
 	t_parallel_alt_task_group(bool pooled) : t_base_task_group(false, pooled) {}
 
-	void enqueue(F& func)
-	{
+	void enqueue(F& func) {
 		// note: GNT counts main so we would be short one worker
 		// (final task would never be executed and hang the pool)
 		m_remaining_tasks.store(thread_pool::get_num_threads() - 1);
@@ -468,8 +472,7 @@ public:
 		}
 	}
 
-	bool execute_step() override
-	{
+	bool execute_step() override {
 		bool is_finished = true;
 
 		for (size_t n = 0; n < m_child_tasks.size(); n++) {
@@ -479,7 +482,10 @@ public:
 		if (!is_finished)
 			return true;
 
+		// PATG's are never actually in the queue, make sure WFF terminates
+		m_in_task_queue.store(false);
 		m_remaining_tasks.store(0);
+
 		m_child_tasks.clear();
 		return false;
 	}
@@ -586,8 +592,18 @@ static inline void for_mt(int32_t start, int32_t end, int32_t step, F&& f) {
 	task_group->enqueue(start, end, step, f);
 	task_group->update_id();
 
-	thread_pool::push_task_group(task_group); // note: for_task re-queues itself for each slice
-	thread_pool::wait_for_finished(task_group); // make the calling thread also run execute_loop
+	#if 0
+	thread_pool::push_task_group(task_group);
+	#else
+	// store the group in all worker queues s.t. each executes a slice
+	for (size_t i = 1; i < thread_pool::get_num_threads(); ++i) {
+		task_group->m_wanted_thread.store(i);
+		thread_pool::push_task_group(task_group);
+	}
+	#endif
+
+	// make the calling thread also run execute_loop
+	thread_pool::wait_for_finished(task_group);
 }
 
 template <typename F>
