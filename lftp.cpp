@@ -344,13 +344,13 @@ namespace thread_pool {
 			#ifdef USE_TASK_STATS_TRACKING
 			for (uint32_t queue_idx: {BASIC_TASK_QUEUE_IDX, ASYNC_TASK_QUEUE_IDX}) {
 				for (uint32_t i = 0; i < thread_pool::MAX_THREADS; i++) {
-					thread_stats[queue_idx][i].num_tasks_run =  0lu;
-					thread_stats[queue_idx][i].sum_exec_time =  0lu;
-					thread_stats[queue_idx][i].min_exec_time = -1lu;
-					thread_stats[queue_idx][i].max_exec_time =  0lu;
-					thread_stats[queue_idx][i].sum_wait_time =  0lu;
-					thread_stats[queue_idx][i].min_wait_time = -1lu;
-					thread_stats[queue_idx][i].max_wait_time =  0lu;
+					thread_stats[queue_idx][i].num_tasks_run = std::numeric_limits<uint64_t>::min();
+					thread_stats[queue_idx][i].sum_exec_time = std::numeric_limits<uint64_t>::min();
+					thread_stats[queue_idx][i].min_exec_time = std::numeric_limits<uint64_t>::max();
+					thread_stats[queue_idx][i].max_exec_time = std::numeric_limits<uint64_t>::min();
+					thread_stats[queue_idx][i].sum_wait_time = std::numeric_limits<uint64_t>::min();
+					thread_stats[queue_idx][i].min_wait_time = std::numeric_limits<uint64_t>::max();
+					thread_stats[queue_idx][i].max_wait_time = std::numeric_limits<uint64_t>::min();
 				}
 			}
 			#endif

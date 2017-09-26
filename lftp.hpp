@@ -174,7 +174,7 @@ public:
 	}
 
 	uint32_t get_id() const { return m_id; }
-	uint64_t get_dt(const t_time t) const { return (t.to_ns() - m_ts); }
+	uint64_t get_dt(const t_time t) const { return (std::max(m_ts.load(), t.to_ns()) - m_ts); }
 
 	void update_id() { m_id = last_id.fetch_add(1); }
 	void set_ts(const t_time t) { m_ts = t.to_ns(); }
@@ -199,8 +199,8 @@ public:
 private:
 	static std::atomic<uint32_t> last_id;
 
-	uint32_t m_id;
-	uint64_t m_ts; // timestamp (ns)
+	std::atomic<uint32_t> m_id;
+	std::atomic<uint64_t> m_ts; // timestamp (ns)
 };
 
 
@@ -218,7 +218,7 @@ public:
 	}
 
 	bool is_async_task() const override { return true; }
-	bool self_delete() const { return (m_self_delete.load()); }
+	bool self_delete() const override { return (m_self_delete.load()); }
 	bool execute_step() override {
 		// *never* called from wait_for_finished
 		(*m_task)();
